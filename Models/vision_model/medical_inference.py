@@ -6,14 +6,14 @@ Handles medical image analysis and diagnostic text generation with optimized per
 import os
 import sys
 import time
-import psutil
-import inspect
-import traceback
-import numpy as np
-import GPUtil
 import torch
+import psutil
+import GPUtil
+import inspect
+import numpy as np
+import traceback
 from pathlib import Path
-from typing import Dict, Optional, Union, Any
+from typing import Dict, Optional, Union, Any, List
 from PIL import Image
 
 # Add the project root directory to Python path for imports
@@ -29,13 +29,9 @@ from transformers import (
 )
 
 from Models.vision_model.config import SystemConfig
+from Models.vision_model.errors import ModelLoadError, ValidationError
 from Models.vision_model.logger import MedicalVisionLogger
-from Models.vision_model.utils import setup_gpu_device, validate_image, get_aspect_ratio_info, Timer
-from Models.vision_model.errors import (
-    ModelLoadError, GPUMemoryError, ImageProcessingError, 
-    InferenceError, ValidationError, TimeoutError
-)
-
+from Models.processors.report_generator import StructuredReportGenerator
 
 
 class MedicalVisionInference:
@@ -45,7 +41,8 @@ class MedicalVisionInference:
         self, 
         model_path: Union[str, Path],
         config: Optional[SystemConfig] = None,
-        log_file: Optional[Path] = None
+        log_file: Optional[Path] = None,
+        knowledge_base_path: Optional[Path] = None
     ):
         """Initialize the Medical Vision Inference system."""
         self.model_path = Path(model_path)
@@ -63,6 +60,12 @@ class MedicalVisionInference:
         self.processor = None
         self.tokenizer = None
         
+        # Initialize report generator
+        self.report_generator = StructuredReportGenerator(
+            medical_knowledge_base=knowledge_base_path
+        )
+        self.logger.info("Initialized structured report generator")
+        
         # Set up device
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
@@ -75,6 +78,378 @@ class MedicalVisionInference:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             
+        # Load the model components
+        self.load_model()
+
+    def load_model(self) -> bool:
+        """Load the model and its components."""
+        try:
+            self.logger.info("Loading processor...")
+            self.processor = AutoProcessor.from_pretrained(self.model_path)
+            
+            self.logger.info("Loading tokenizer...")
+            self.tokenizer = getattr(self.processor, "tokenizer", None)
+            if self.tokenizer is None:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+            
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_quant_storage_dtype=torch.float16
+            )
+            
+            # Configure GPU memory management
+            if torch.cuda.is_available():
+                # Analyze GPU memory
+                gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                free_mem = torch.cuda.memory_allocated(0) / (1024**3)
+                available_mem = gpu_mem - free_mem
+                
+                self.logger.info("\nGPU Memory Analysis:")
+                self.logger.info("   Device: " + torch.cuda.get_device_name(0))
+                self.logger.info(f"   Total: {gpu_mem:.1f}GB")
+                self.logger.info(f"   Reserved: {free_mem:.1f}GB")
+                self.logger.info(f"   Allocated: {torch.cuda.memory_allocated(0)/(1024**3):.1f}GB")
+                self.logger.info(f"   Available: {available_mem:.1f}GB")
+                
+                # Configure memory more aggressively
+                gpu_limit = min(available_mem * 0.95, available_mem - 0.5)  # Use 95% of available memory, keep 0.5GB buffer
+                
+                # Set up memory configuration
+                max_memory = {
+                    0: f"{gpu_limit:.1f}GB",  # GPU memory
+                    "cpu": "16GB"  # CPU memory
+                }
+                
+                self.logger.info("Configuring memory management...")
+                self.logger.info("Configuring automatic device mapping...")
+                self.logger.info("Memory configuration:")
+                self.logger.info(f"   GPU: {gpu_limit:.1f}GB")
+                self.logger.info(f"   CPU: 16GB")
+                self.logger.info("Using maximum GPU memory strategy")
+            else:
+                max_memory = None
+                
+            # Configure model loading with optimizations
+            self.logger.info("Loading model with optimizations...")
+            
+            # Set up torch compile for faster inference
+            if torch.cuda.is_available():
+                torch._dynamo.config.suppress_errors = True
+                torch._dynamo.config.cache_size_limit = 64
+            
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                self.model_path,
+                device_map="auto",
+                max_memory=max_memory,
+                quantization_config=quantization_config,
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+                offload_folder="Models/vision_model/offload"
+            )
+            
+            # Enable model optimizations
+            if torch.cuda.is_available():
+                self.model.to(self.device)
+                if hasattr(self.model, "config"):
+                    self.model.config.use_cache = True
+                self.model = torch.compile(
+                    self.model,
+                    mode="max-autotune",
+                    fullgraph=True,
+                    dynamic=True
+                )
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Error loading model: {str(e)}")
+            raise ModelLoadError(f"Failed to load model: {str(e)}")
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def prepare_inputs_with_validation(self, image: Image.Image, prompt: str) -> Dict:
+        """Prepare model inputs with validation and optimization."""
+        if not isinstance(image, Image.Image):
+            raise ValueError("Input must be a PIL Image")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Prompt must be a non-empty string")
+            
+        self.logger.info("Processing inputs with validation...")
+        try:
+            # Pre-process image for optimization
+            image = image.convert('RGB')
+            if max(image.size) > 560:  # Max dimension optimization
+                image.thumbnail((560, 560), Image.Resampling.LANCZOS)
+            
+            # Use torch.jit for processor if available
+            if hasattr(self.processor, "torch_jit"):
+                processor_fn = self.processor.torch_jit
+            else:
+                processor_fn = self.processor
+                
+            # Process inputs with optimized settings
+            inputs = processor_fn(
+                images=image,
+                text=prompt,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=512,
+                truncation=True
+            )
+            
+            validated_inputs = {}
+            for key, tensor in inputs.items():
+                if isinstance(tensor, torch.Tensor):
+                    validated_inputs[key] = tensor.clone().to(self.device).contiguous()
+                else:
+                    validated_inputs[key] = tensor
+            
+            if "aspect_ratio_ids" in validated_inputs:
+                aspect_ratio_ids = validated_inputs["aspect_ratio_ids"]
+                if len(aspect_ratio_ids.shape) > 1:
+                    validated_inputs["aspect_ratio_ids"] = aspect_ratio_ids.squeeze()
+                elif len(aspect_ratio_ids.shape) == 0:
+                    batch_size = validated_inputs["input_ids"].shape[0]
+                    validated_inputs["aspect_ratio_ids"] = torch.zeros(
+                        (batch_size,),
+                        dtype=torch.long,
+                        device=self.device
+                    )
+            
+            keys_to_remove = []
+            for key, tensor in validated_inputs.items():
+                if isinstance(tensor, torch.Tensor) and 0 in tensor.shape:
+                    self.logger.warning(f"Removing {key} with invalid shape: {tensor.shape}")
+                    keys_to_remove.append(key)
+            
+            for key in keys_to_remove:
+                del validated_inputs[key]
+            
+            return validated_inputs
+        except Exception as e:
+            raise ValidationError(f"Input validation failed: {str(e)}")
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def generate_structured_report(
+        self,
+        model_output: str,
+        image_analysis: Dict,
+        patient_context: Optional[Dict] = None,
+        output_format: str = 'json'
+    ) -> Union[Dict, str]:
+        """Generate a structured medical report."""
+        self.logger.info("Generating structured medical report...")
+        
+        try:
+            report = self.report_generator.generate_structured_report(
+                model_output=model_output,
+                image_analysis=image_analysis,
+                patient_context=patient_context
+            )
+            
+            if output_format.lower() == 'json':
+                return self._format_report_as_json(report)
+            elif output_format.lower() == 'text':
+                return self._format_report_as_text(report)
+            else:
+                raise ValueError(f"Unsupported output format: {output_format}")
+                
+        except Exception as e:
+            self.logger.error(f"Error generating structured report: {str(e)}")
+            raise
+
+    def _format_report_as_json(self, report) -> Dict:
+        """Format report as JSON."""
+        return {
+            'clinical_findings': report.clinical_findings,
+            'diagnostic_interpretation': report.diagnostic_interpretation,
+            'technical_details': report.technical_details,
+            'patient_explanation': report.patient_explanation,
+            'additional_notes': report.additional_notes,
+            'metadata': report.metadata
+        }
+        
+    def _format_report_as_text(self, report) -> str:
+        """Format report as text."""
+        sections = []
+        sections.extend([
+            "MEDICAL DIAGNOSTIC REPORT",
+            "=" * 30,
+            f"Report ID: {report.metadata['report_id']}",
+            f"Date: {report.metadata['timestamp']}\n",
+            "CLINICAL FINDINGS",
+            "-" * 20
+        ])
+        
+        findings = report.clinical_findings.get('observations', {})
+        sections.append("Primary Findings:")
+        for finding in findings.get('primary_findings', []):
+            sections.append(f"- {finding}")
+            
+        sections.append("\nAbnormalities:")
+        for abnormality in findings.get('abnormalities', []):
+            sections.append(f"- {abnormality}")
+        
+        diagnosis = report.diagnostic_interpretation.get('primary_diagnosis', {})
+        sections.extend([
+            "\nDIAGNOSTIC INTERPRETATION",
+            "-" * 20,
+            f"Primary Diagnosis: {diagnosis.get('condition', 'Not specified')}",
+            f"Confidence: {diagnosis.get('confidence', 'Not specified')}"
+        ])
+        
+        sections.append("\nSupporting Evidence:")
+        for evidence in diagnosis.get('supporting_evidence', []):
+            sections.append(f"- {evidence}")
+        
+        sections.extend([
+            "\nPATIENT EXPLANATION",
+            "-" * 20
+        ])
+        
+        explanation = report.patient_explanation
+        for key, value in explanation.get('simplified_findings', {}).items():
+            sections.append(f"{key}: {value}")
+        
+        return "\n".join(sections)
+
+    def analyze_image(
+        self,
+        image: Union[str, Path, Image.Image],
+        prompt: Optional[str] = None,
+        generation_params: Optional[Dict] = None
+    ) -> Dict:
+        """Analyze a medical image and generate a report."""
+        process_start = time.time()
+        
+        try:
+            # Load and validate image
+            if isinstance(image, (str, Path)):
+                image = Image.open(image)
+            elif not isinstance(image, Image.Image):
+                raise ValueError("Image must be a file path or PIL Image")
+            
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            self.logger.info(f"Image loaded: {image.size} - Mode: {image.mode}")
+            
+            # Default prompt if none provided
+            if prompt is None:
+                prompt = (
+                    "Please analyze this medical chest X-ray image. Describe:\n"
+                    "1. Type of imaging and quality\n"
+                    "2. Key anatomical findings\n"
+                    "3. Any abnormalities or pathological features\n"
+                    "4. Possible differential diagnoses\n"
+                    "5. Recommended next steps or further investigations\n"
+                    "Provide a concise, professional medical assessment."
+                )
+            
+            # Process image and generate analysis
+            inputs = self.prepare_inputs_with_validation(image, prompt)
+            
+            gen_params = {
+                "max_new_tokens": 200,
+                "do_sample": True,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "repetition_penalty": 1.2,
+                "no_repeat_ngram_size": 3,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id
+            }
+            
+            if generation_params:
+                gen_params.update(generation_params)
+            
+            gen_start = time.time()
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    **gen_params
+                )
+            
+            if outputs is None or len(outputs) == 0:
+                raise RuntimeError("Model generated empty output")
+            
+            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            analysis = generated_text.replace(prompt, "").strip() if prompt in generated_text else generated_text.strip()
+            
+            # Clean up output
+            sentences = analysis.split('. ')
+            cleaned_sentences = []
+            seen = set()
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if sentence and sentence not in seen:
+                    cleaned_sentences.append(sentence)
+                    seen.add(sentence)
+            
+            analysis = '. '.join(cleaned_sentences)
+            if not analysis.endswith('.'):
+                analysis += '.'
+            
+            gen_time = time.time() - gen_start
+            
+            # Generate structured report
+            try:
+                image_analysis_data = {
+                    'image_type': 'x-ray',
+                    'image_quality': {
+                        'dimensions': image.size,
+                        'mode': image.mode,
+                        'aspect_ratio': image.size[0] / image.size[1]
+                    },
+                    'processing_time': gen_time
+                }
+                
+                report = self.generate_structured_report(
+                    model_output=analysis,
+                    image_analysis=image_analysis_data
+                )
+                
+                return {
+                    'analysis': analysis,
+                    'structured_report': report,
+                    'inference_time': gen_time,
+                    'total_time': time.time() - process_start,
+                    'prompt': prompt,
+                    'success': True
+                }
+                
+            except Exception as report_error:
+                self.logger.error(f"Failed to generate structured report: {str(report_error)}")
+                return {
+                    'analysis': analysis,
+                    'inference_time': gen_time,
+                    'total_time': time.time() - process_start,
+                    'prompt': prompt,
+                    'success': True,
+                    'report_error': str(report_error)
+                }
+            
+        except Exception as e:
+            total_time = time.time() - process_start
+            self.logger.error(f"Analysis failed: {str(e)}")
+            return {
+                'analysis': None,
+                'inference_time': 0,
+                'total_time': total_time,
+                'prompt': prompt,
+                'error': str(e),
+                'success': False
+            }
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         # Load the model components
         self.load_model()
 
@@ -303,172 +678,27 @@ class MedicalVisionInference:
             self.logger.error(f"Error loading model: {e}")
             return False
 
-    def prepare_inputs_with_validation(self, image, prompt):
-        """Prepare model inputs with comprehensive validation using processor defaults.
-        
-        Args:
-            image: PIL Image to process
-            prompt: Text prompt for analysis
-            
-        Returns:
-            dict: Validated inputs ready for model
-            
-        Raises:
-            ValueError: If inputs are invalid
-            RuntimeError: If processing fails
-        """
-        try:
-            # Initial basic validation
-            if not isinstance(image, Image.Image):
-                raise ValueError("Input must be a PIL Image")
-            if not isinstance(prompt, str) or not prompt.strip():
-                raise ValueError("Prompt must be a non-empty string")
-                
-            # Let the processor handle everything with its default settings
-            self.logger.info("Processing inputs with validation...")
-            inputs = self.processor(
-                images=image,
-                text=prompt,
-                return_tensors="pt"
-            )
-            
-            # Validate all tensors with detailed checking
-            required_tensors = {
-                "input_ids": (torch.long, 2),  # (batch_size, seq_length)
-                "attention_mask": (torch.long, 2),  # (batch_size, seq_length)
-                "pixel_values": (torch.float32, 6)  # (batch_size, seq_len, num_frames, channels, height, width)
-            }
-            
-            for key, (dtype, expected_dims) in required_tensors.items():
-                # Check existence
-                if key not in inputs:
-                    raise ValueError(f"Missing required tensor: {key}")
-                    
-                tensor = inputs[key]
-                
-                # Check for None
-                if tensor is None:
-                    raise ValueError(f"Tensor {key} is None")
-                    
-                # Check type
-                if not isinstance(tensor, torch.Tensor):
-                    raise TypeError(f"{key} must be a tensor, got {type(tensor)}")
-                    
-                # Check dimensions
-                if len(tensor.shape) != expected_dims:
-                    raise ValueError(f"{key} has wrong dimensions: {tensor.shape}, expected {expected_dims}D")
-                    
-                # Check for invalid values
-                if torch.isnan(tensor).any():
-                    raise ValueError(f"{key} contains NaN values")
-                if torch.isinf(tensor).any():
-                    raise ValueError(f"{key} contains infinite values")
-                    
-                # Convert dtype if needed
-                if tensor.dtype != dtype:
-                    self.logger.warning(f"Converting {key} from {tensor.dtype} to {dtype}")
-                    inputs[key] = tensor.to(dtype)
-            
-            # Move all inputs to device and ensure they're contiguous
-            validated_inputs = {}
-            for key, tensor in inputs.items():
-                if isinstance(tensor, torch.Tensor):
-                    validated_inputs[key] = tensor.clone().to(self.device).contiguous()
-                else:
-                    validated_inputs[key] = tensor
-            
-            # Fix malformed tensors that the processor sometimes creates
-            if "aspect_ratio_ids" in validated_inputs:
-                # Fix aspect_ratio_ids shape - should be (batch_size,) not (batch_size, 1) or empty
-                aspect_ratio_ids = validated_inputs["aspect_ratio_ids"]
-                if len(aspect_ratio_ids.shape) > 1:
-                    validated_inputs["aspect_ratio_ids"] = aspect_ratio_ids.squeeze()
-                elif len(aspect_ratio_ids.shape) == 0:  # Empty tensor - fix it
-                    # Recreate with proper batch size
-                    batch_size = validated_inputs["input_ids"].shape[0]
-                    validated_inputs["aspect_ratio_ids"] = torch.zeros((batch_size,), dtype=torch.long, device=self.device)
-                    self.logger.info(f"Fixed empty aspect_ratio_ids, new shape: {validated_inputs['aspect_ratio_ids'].shape}")
-            
-            # Remove problematic tensors with invalid shapes
-            keys_to_remove = []
-            for key, tensor in validated_inputs.items():
-                if isinstance(tensor, torch.Tensor):
-                    # Remove tensors with 0 dimensions (invalid)
-                    if 0 in tensor.shape:
-                        self.logger.warning(f"Removing {key} with invalid shape: {tensor.shape}")
-                        keys_to_remove.append(key)
-                    # Check for aspect_ratio_mask being None
-                    elif key == "aspect_ratio_mask" and tensor is None:
-                        self.logger.warning(f"Removing None {key}")
-                        keys_to_remove.append(key)
-            
-            for key in keys_to_remove:
-                del validated_inputs[key]
-            
-            # Log the shapes that the processor created
-            self.logger.info("Processor-generated input shapes (after cleanup):")
-            for key, tensor in validated_inputs.items():
-                if isinstance(tensor, torch.Tensor):
-                    self.logger.info(f"  {key}: {tensor.shape}, dtype={tensor.dtype}")
-            
-            return validated_inputs
-        except Exception as e:
-            self.logger.error(f"Error preparing inputs: {str(e)}")
-            raise
-
-    def analyze_medical_image(
+    def analyze_image(
         self,
-        image_path: Union[str, Path],
+        image: Union[str, Path, Image.Image],
         prompt: Optional[str] = None,
-        generation_params: Optional[Dict[str, Any]] = None,
-        timeout: int = 300,  # 5 minutes timeout
-        max_retries: int = 3  # Maximum retry attempts
-    ) -> Dict[str, Any]:
-        """Analyze a medical image and generate detailed findings.
-        
-        Args:
-            image_path: Path to medical image file
-            prompt: Optional custom analysis prompt
-            generation_params: Optional generation parameters override
-            timeout: Maximum time in seconds for the operation
-            max_retries: Maximum number of retry attempts
-            
-        Returns:
-            Dict containing:
-                - analysis: Generated analysis text
-                - inference_time: Model inference time
-                - total_time: Total processing time
-                - prompt: Used prompt
-                - success: Operation success flag
-                - error: Error message if failed
-                
-        Raises:
-            ValidationError: If image path is invalid
-            ModelLoadError: If model is not initialized
-            ImageProcessingError: If image processing fails
-            InferenceError: If model inference fails
-            TimeoutError: If operation exceeds timeout
-        """
-        # Validate inputs
+        generation_params: Optional[Dict] = None
+    ) -> Dict:
+        """Analyze a medical image and generate a report."""
         process_start = time.time()
+        
         try:
-            image_path = Path(image_path)
-            if not image_path.exists():
-                raise ValidationError(f"Image not found: {image_path}")
-            
-            if not self.verify_model_state():
-                raise ModelLoadError("Model not properly initialized")
-
-            self.logger.info(f"Analyzing medical image: {image_path.name}")
-            
             # Load and validate image
-            # Load and validate image
-            image = Image.open(image_path)
+            if isinstance(image, (str, Path)):
+                image = Image.open(image)
+            elif not isinstance(image, Image.Image):
+                raise ValueError("Image must be a file path or PIL Image")
+            
             if image.mode != "RGB":
                 image = image.convert("RGB")
             self.logger.info(f"Image loaded: {image.size} - Mode: {image.mode}")
             
-            # Prepare prompt
+            # Default prompt if none provided
             if prompt is None:
                 prompt = (
                     "Please analyze this medical chest X-ray image. Describe:\n"
@@ -480,145 +710,94 @@ class MedicalVisionInference:
                     "Provide a concise, professional medical assessment."
                 )
             
-            # Prepare inputs with validation
+            # Process image and generate analysis
             inputs = self.prepare_inputs_with_validation(image, prompt)
             
-            # Use the inputs exactly as the processor created them, with minimal modifications
-            generation_inputs = inputs.copy()
-            
-            # Use the inputs exactly as the processor created them
-            generation_inputs = {}
-            
-            # Copy and move tensors to the correct device
-            for key, value in inputs.items():
-                if isinstance(value, torch.Tensor):
-                    generation_inputs[key] = value.to(self.device)
-                else:
-                    generation_inputs[key] = value
-            
-            # Create or fix aspect_ratio_ids if needed
-            if "aspect_ratio_ids" not in generation_inputs:
-                aspect_ratio = image.size[0] / image.size[1]
-                aspect_ratio_id = 1 if aspect_ratio < 0.75 else 2 if aspect_ratio > 1.33 else 0
-                generation_inputs["aspect_ratio_ids"] = torch.full(
-                    (inputs["input_ids"].shape[0],), aspect_ratio_id, 
-                    dtype=torch.long, device=self.device
-                )
-            
-            # Create aspect_ratio_mask if it's missing or None
-            if "aspect_ratio_mask" not in generation_inputs or generation_inputs["aspect_ratio_mask"] is None:
-                batch_size = inputs["input_ids"].shape[0]
-                generation_inputs["aspect_ratio_mask"] = torch.ones(
-                    (batch_size, 4), dtype=torch.bool, device=self.device
-                )
-                self.logger.info(f"Created aspect_ratio_mask with shape: {generation_inputs['aspect_ratio_mask'].shape}")
-
-            # Log final generation inputs
-            self.logger.info("Final generation inputs:")
-            for key, value in generation_inputs.items():
-                if isinstance(value, torch.Tensor):
-                    self.logger.info(f"  {key}: shape={value.shape}, dtype={value.dtype}, device={value.device}")
-            
-            # Generation parameters - optimized to reduce repetition
             gen_params = {
                 "max_new_tokens": 200,
-                "do_sample": True,          # Enable sampling to reduce repetition
-                "temperature": 0.7,         # Moderate randomness
-                "top_p": 0.9,              # Nucleus sampling
-                "repetition_penalty": 1.2,  # Penalize repetition
-                "no_repeat_ngram_size": 3,  # Prevent 3-gram repetition
+                "do_sample": True,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "repetition_penalty": 1.2,
+                "no_repeat_ngram_size": 3,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "eos_token_id": self.tokenizer.eos_token_id
             }
             
-            # Add any custom generation parameters
             if generation_params:
                 gen_params.update(generation_params)
             
-            # Perform generation with detailed error logging
-            self.logger.info("Starting model inference...")
             gen_start = time.time()
             
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    **gen_params
+                )
+            
+            if outputs is None or len(outputs) == 0:
+                raise RuntimeError("Model generated empty output")
+            
+            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            analysis = generated_text.replace(prompt, "").strip() if prompt in generated_text else generated_text.strip()
+            
+            # Clean up output
+            sentences = analysis.split('. ')
+            cleaned_sentences = []
+            seen = set()
+            
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if sentence and sentence not in seen:
+                    cleaned_sentences.append(sentence)
+                    seen.add(sentence)
+            
+            analysis = '. '.join(cleaned_sentences)
+            if not analysis.endswith('.'):
+                analysis += '.'
+            
+            gen_time = time.time() - gen_start
+            
+            # Generate structured report
             try:
-                # Add detailed debugging before generation
-                self.logger.info("Pre-generation validation:")
-                for k, v in generation_inputs.items():
-                    if v is None:
-                        raise ValueError(f"Input {k} is None before generation")
-                    elif isinstance(v, torch.Tensor):
-                        self.logger.info(f"  {k}: shape={v.shape}, dtype={v.dtype}, device={v.device}, requires_grad={v.requires_grad}")
-                        if torch.isnan(v).any():
-                            raise ValueError(f"Input {k} contains NaN values")
-                        if torch.isinf(v).any():
-                            raise ValueError(f"Input {k} contains infinite values")
+                image_analysis_data = {
+                    'image_type': 'x-ray',
+                    'image_quality': {
+                        'dimensions': image.size,
+                        'mode': image.mode,
+                        'aspect_ratio': image.size[0] / image.size[1]
+                    },
+                    'processing_time': gen_time
+                }
                 
-                # Clear any gradients and ensure no grad computation
-                with torch.no_grad():
-                    # Use all inputs including the fixed aspect_ratio_mask
-                    self.logger.info("Attempting generation with all required inputs...")
-                    outputs = self.model.generate(
-                        **generation_inputs,
-                        **gen_params
-                    )
-                
-                if outputs is None or len(outputs) == 0:
-                    raise RuntimeError("Model generated empty output")
-                
-                # Decode the output
-                generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                
-                # Remove the prompt from the generated text
-                if prompt in generated_text:
-                    analysis = generated_text.replace(prompt, "").strip()
-                else:
-                    analysis = generated_text.strip()
-                
-                # Clean up repetitive text (simple approach)
-                sentences = analysis.split('. ')
-                cleaned_sentences = []
-                seen_sentences = set()
-                
-                for sentence in sentences:
-                    sentence = sentence.strip()
-                    if sentence and sentence not in seen_sentences:
-                        cleaned_sentences.append(sentence)
-                        seen_sentences.add(sentence)
-                    elif len(cleaned_sentences) >= 3:  # Stop after 3 unique sentences if repetition starts
-                        break
-                
-                analysis = '. '.join(cleaned_sentences)
-                if analysis and not analysis.endswith('.'):
-                    analysis += '.'
-                
-                gen_time = time.time() - gen_start
-                total_time = time.time() - process_start
-                
-                self.logger.info(f"Analysis completed successfully in {gen_time:.2f}s")
-                self.logger.info(f"Generated text length: {len(analysis)} characters")
+                report = self.generate_structured_report(
+                    model_output=analysis,
+                    image_analysis=image_analysis_data
+                )
                 
                 return {
                     'analysis': analysis,
+                    'structured_report': report,
                     'inference_time': gen_time,
-                    'total_time': total_time,
+                    'total_time': time.time() - process_start,
                     'prompt': prompt,
                     'success': True
                 }
                 
-            except Exception as e:
-                # Log detailed error information
-                self.logger.error(f"Generation failed with error: {str(e)}")
-                self.logger.error(f"Error type: {type(e).__name__}")
-                
-                # Try to get more specific error info
-                import traceback
-                self.logger.error("Full traceback:")
-                self.logger.error(traceback.format_exc())
-                
-                raise InferenceError(f"Model inference failed: {str(e)}")
+            except Exception as report_error:
+                self.logger.error(f"Failed to generate structured report: {str(report_error)}")
+                return {
+                    'analysis': analysis,
+                    'inference_time': gen_time,
+                    'total_time': time.time() - process_start,
+                    'prompt': prompt,
+                    'success': True,
+                    'report_error': str(report_error)
+                }
             
         except Exception as e:
             total_time = time.time() - process_start
-            self.logger.error(f"Analysis failed after {total_time:.2f}s: {str(e)}")
+            self.logger.error(f"Analysis failed: {str(e)}")
             return {
                 'analysis': None,
                 'inference_time': 0,
@@ -631,12 +810,50 @@ class MedicalVisionInference:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def verify_model_state(self) -> bool:
-        """Verify model is in a valid state for inference.
+    def analyze_medical_image(
+        self,
+        image_path: Union[str, Path],
+        diagnostic_type: str = 'general',
+        custom_prompt: Optional[str] = None
+    ) -> Dict:
+        """Analyze a medical image (compatibility method).
         
-        Returns:
-            bool: True if model is ready for inference, False otherwise
+        This is a compatibility wrapper for analyze_image that maintains API compatibility.
         """
+        prompt = custom_prompt
+        if prompt is None:
+            if diagnostic_type == 'general':
+                prompt = (
+                    "Please analyze this medical image. Describe:\n"
+                    "1. Type of imaging and quality\n"
+                    "2. Key anatomical findings\n"
+                    "3. Any abnormalities or pathological features\n"
+                    "4. Possible differential diagnoses\n"
+                    "5. Recommended next steps\n"
+                    "Provide a professional medical assessment."
+                )
+            elif diagnostic_type == 'detailed':
+                prompt = (
+                    "Please provide a detailed analysis of this medical image:\n"
+                    "1. Image type, quality, and positioning\n"
+                    "2. Comprehensive anatomical description\n"
+                    "3. Detailed pathological findings\n"
+                    "4. Measurements and comparisons\n"
+                    "5. Differential diagnoses with likelihood\n"
+                    "6. Recommended follow-up studies\n"
+                    "7. Clinical correlation suggestions"
+                )
+            else:
+                prompt = (
+                    "Analyze this medical image focusing on:\n"
+                    f"- Specific diagnostic type: {diagnostic_type}\n"
+                    "- Key findings and abnormalities\n"
+                    "- Relevant measurements\n"
+                    "- Differential diagnoses\n"
+                    "- Recommendations"
+                )
+        
+        return self.analyze_image(image_path, prompt=prompt)
 
     def verify_model_state(self) -> bool:
         """Verify model is in a valid state for inference.
