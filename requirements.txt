@@ -1,0 +1,25 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+pillow>=9.0.0
+numpy>=1.21.0
+
+# Medical image processing
+pydicom>=2.3.0
+nibabel>=4.0.0  # For NIFTI format support
+
+# Text processing
+nltk>=3.6.0
+spacy>=3.4.0
+
+# Optimization
+bitsandbytes>=0.38.0
+accelerate>=0.20.0
+
+# Utilities
+tqdm>=4.65.0
+psutil>=5.8.0
+
+# Logging
+loguru>=0.6.0

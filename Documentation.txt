@@ -1,0 +1,28 @@
+APP - 
+    Access -
+    login - 
+        Main - Index -
+                Home - 
+                Access the main Function 
+                - Input Text& image 
+                - classification of image to select model based on text context and image understanding (i.e, looks like Xray image detection)
+                - Context understanding based on LLM and Reduce the scope of possible disease according to texted symptoms and issues 
+                
+                - Multimodular State : integraing the understanding from both context till the most confindent resullt is obtained 
+
+                - Output - disease Report with understanding of why model think this is cause
+                    |
+                    |
+                    |
+                    |
+                Connect and transfer the report and finding to Specialist for Correction and Confirmation 
+
+
+Backend:
+LLM based model in local 
+CNN hybrid model 
+
+
+
+User Based Approch 
+Health Worker 
