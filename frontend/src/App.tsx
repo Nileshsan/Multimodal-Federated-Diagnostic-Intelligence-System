@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { WelcomePage } from "./components/WelcomePage";
 import { LoginPage } from "./components/LoginPage";
 import { PersonalDetailsPage } from "./components/PersonalDetailsPage";
@@ -10,10 +10,19 @@ import { DiagnosisHistoryPage } from "./components/DiagnosisHistoryPage";
 type Page = 'welcome' | 'login' | 'dashboard' | 'profile' | 'upload' | 'results' | 'history';
 type UserType = 'patient' | 'doctor' | null;
 
+import { LoadingSpinner } from './components/LoadingSpinner';
+
 export default function App() {
+  const [loading, setLoading] = useState(true);
   const [currentPage, setCurrentPage] = useState<Page>('welcome');
   const [userType, setUserType] = useState<UserType>(null);
   const [diagnosisResults, setDiagnosisResults] = useState<any>(null);
+
+  useEffect(() => {
+    // Simulate initial load
+    const timer = setTimeout(() => setLoading(false), 1000);
+    return () => clearTimeout(timer);
+  }, []);
 
   const handleGetStarted = () => {
     setCurrentPage('login');
@@ -67,6 +76,10 @@ export default function App() {
     });
     setCurrentPage('results');
   };
+
+  if (loading) {
+    return <LoadingSpinner />;
+  }
 
   const renderCurrentPage = () => {
     switch (currentPage) {
