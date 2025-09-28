@@ -7,7 +7,15 @@
     plugins: [react()],
     base: '/Multimodal-Federated-Diagnostic-Intelligence-System/',
     build: {
-      outDir: 'dist'
+      outDir: 'dist',
+      sourcemap: true,
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            vendor: ['react', 'react-dom', 'react-router-dom'],
+          }
+        }
+      }
     },
     resolve: {
       extensions: ['.js', '.jsx', '.ts', '.tsx', '.json'],
