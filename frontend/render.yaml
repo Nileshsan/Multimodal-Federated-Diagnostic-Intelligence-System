@@ -2,9 +2,12 @@ services:
   - type: web
     name: x-ray-diagnosis-frontend
     env: static
-    buildCommand: npm install && npm run build
-    staticPublishPath: ./build
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
     routes:
       - type: rewrite
         source: /*
         destination: /index.html
+    envVars:
+      - key: NODE_VERSION
+        value: 18
