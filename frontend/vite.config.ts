@@ -5,7 +5,7 @@
 
   export default defineConfig({
     plugins: [react()],
-    base: '/MFDIS/',
+    base: '/Multimodal-Federated-Diagnostic-Intelligence-System/',
     build: {
       outDir: 'dist'
     },
