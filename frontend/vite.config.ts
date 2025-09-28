@@ -5,12 +5,8 @@
 
   export default defineConfig({
     plugins: [react()],
-    base: './',
     build: {
-      outDir: 'dist',
-      sourcemap: false,
-      chunkSizeWarningLimit: 1000,
-      target: 'esnext'
+      outDir: 'dist'
     },
     resolve: {
       extensions: ['.js', '.jsx', '.ts', '.tsx', '.json'],
