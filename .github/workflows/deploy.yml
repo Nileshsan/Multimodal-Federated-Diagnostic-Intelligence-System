@@ -1,4 +1,4 @@
-name: Deploy Frontend to GitHub Pages
+name: Deploy MFDIS Frontend to GitHub Pages
 
 on:
   push:
