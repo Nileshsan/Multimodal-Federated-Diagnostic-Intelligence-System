@@ -1,5 +1,6 @@
 {
       "name": "x-ray-diagnosis-app",
+      "homepage": "https://nileshsan.github.io/Multimodal-Federated-Diagnostic-Intelligence-System/",
       "version": "0.1.0",
       "private": true,
       "dependencies": {
@@ -59,6 +60,5 @@
             "preview": "vite preview",
             "predeploy": "npm run build",
             "deploy": "gh-pages -d dist"
-      },
-      "homepage": "https://nileshsan.github.io/Multimodal-Federated-Diagnostic-Intelligence-System/"
+      }
 }
