@@ -1,16 +1,15 @@
 """
-Fixed Medical Vision Inference System for Llama 3.2 11B Vision Model
-Addresses the 'NoneType' object has no attribute 'reshape' error.
+Medical Vision Inference System for Llama 3.2 11B Vision Model
+Fixed version based on working implementation.
 """
 
 import os
 import sys
 import time
-import psutil
-import inspect
-import numpy as np
-import GPUtil
 import torch
+import psutil
+import GPUtil
+import traceback
 from pathlib import Path
 from typing import Dict, Optional, Union, Any
 from PIL import Image
@@ -28,12 +27,10 @@ from transformers import (
 )
 
 from Models.vision_model.config import SystemConfig
+from Models.vision_model.errors import ModelLoadError, ValidationError
 from Models.vision_model.logger import MedicalVisionLogger
-from Models.vision_model.utils import setup_gpu_device, validate_image, get_aspect_ratio_info, Timer
-from Models.vision_model.errors import (
-    ModelLoadError, GPUMemoryError, ImageProcessingError, 
-    InferenceError, ValidationError, TimeoutError
-)
+from Models.processors.report_generator import StructuredReportGenerator
+
 
 class MedicalVisionInference:
     """Medical Vision Inference system using Llama 3.2 11B Vision Model."""
@@ -42,9 +39,15 @@ class MedicalVisionInference:
         self, 
         model_path: Union[str, Path],
         config: Optional[SystemConfig] = None,
-        log_file: Optional[Path] = None
+        log_file: Optional[Path] = None,
+        knowledge_base_path: Optional[Path] = None
     ):
         """Initialize the Medical Vision Inference system."""
+        # Clear any existing GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        
         self.model_path = Path(model_path)
         if not self.model_path.exists():
             raise ModelLoadError(f"Model path not found: {model_path}")
@@ -59,13 +62,28 @@ class MedicalVisionInference:
         self.model = None
         self.processor = None
         self.tokenizer = None
-        self.device = self.config.model.device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Clear GPU memory
+        # Initialize report generator
+        if knowledge_base_path:
+            self.report_generator = StructuredReportGenerator(
+                medical_knowledge_base=knowledge_base_path
+            )
+            self.logger.info("Initialized structured report generator")
+        else:
+            self.report_generator = None
+
+        # Configure CUDA settings for better memory management and shared memory access
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
-    
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            
+            # Set environment variables for optimal memory allocation - FROM WORKING CODE
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
     def validate_gpu_requirements(self):
         """Validate GPU requirements before loading."""
         if not torch.cuda.is_available():
@@ -89,7 +107,7 @@ class MedicalVisionInference:
             return False, f"Insufficient GPU memory: {available_mem:.1f}GB"
             
         return True, None
-    
+
     def load_model(self):
         """Load model with optimizations for 8GB VRAM."""
         self.logger.info("\nLoading model with optimizations...")
@@ -116,7 +134,7 @@ class MedicalVisionInference:
                 self.logger.error(f"Failed to load tokenizer: {str(e)}")
                 raise ModelLoadError("Failed to initialize tokenizer")
             
-            # Setup quantization
+            # Setup quantization - EXACTLY as in working code
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16,
@@ -125,18 +143,69 @@ class MedicalVisionInference:
                 bnb_4bit_quant_storage_dtype=torch.float16
             )
             
-            # Load model with optimizations
+            # Load model with optimizations - EXACTLY as in working code with fallback
             self.logger.info("Loading vision-language model...")
             
-            self.model = AutoModelForImageTextToText.from_pretrained(
-                self.model_path,
-                device_map="auto",
-                max_memory={0: "7.2GB", "cpu": "16GB"},
-                quantization_config=quantization_config,
-                low_cpu_mem_usage=True,
-                dtype=torch.float16,
-                trust_remote_code=True
-            )
+            try:
+                # First attempt with standard configuration
+                self.model = AutoModelForImageTextToText.from_pretrained(
+                    self.model_path,
+                    device_map="auto",
+                    max_memory={0: "7.2GB", "cpu": "16GB"},
+                    quantization_config=quantization_config,
+                    low_cpu_mem_usage=True,
+                    dtype=torch.float16,
+                    trust_remote_code=True
+                )
+                self.logger.info("Model loaded successfully on first attempt!")
+                
+            except torch.cuda.OutOfMemoryError as oom_error:
+                self.logger.error(f"First attempt failed with CUDA OOM: {oom_error}")
+                
+                # Clear all GPU memory
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+                torch.cuda.reset_peak_memory_stats()
+                
+                self.logger.info("Retrying with reduced memory limits...")
+                
+                # Second attempt with more conservative settings
+                try:
+                    self.model = AutoModelForImageTextToText.from_pretrained(
+                        self.model_path,
+                        device_map="auto",
+                        max_memory={0: "6.5GB", "cpu": "20GB"},  # Reduce GPU, increase CPU
+                        quantization_config=quantization_config,
+                        low_cpu_mem_usage=True,
+                        dtype=torch.float16,
+                        trust_remote_code=True
+                    )
+                    self.logger.info("Model loaded successfully on second attempt!")
+                    
+                except Exception as e2:
+                    self.logger.error(f"Second attempt also failed: {e2}")
+                    
+                    # Third attempt with even more aggressive CPU offloading
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    
+                    self.logger.info("Final attempt with maximum CPU offloading...")
+                    
+                    self.model = AutoModelForImageTextToText.from_pretrained(
+                        self.model_path,
+                        device_map="auto",
+                        max_memory={0: "6.0GB", "cpu": "24GB"},  # Even more conservative
+                        quantization_config=quantization_config,
+                        low_cpu_mem_usage=True,
+                        dtype=torch.float16,
+                        trust_remote_code=True
+                    )
+                    self.logger.info("Model loaded successfully on final attempt!")
+            
+            # Verify model loaded correctly
+            if self.model is None:
+                raise RuntimeError("Model is None after loading attempts")
             
             load_time = time.time() - start_time
             self.logger.info(f"Model loaded successfully in {load_time:.2f} seconds")
@@ -146,9 +215,9 @@ class MedicalVisionInference:
         except Exception as e:
             self.logger.error(f"Error loading model: {e}")
             return False
-    
+
     def prepare_inputs_with_validation(self, image, prompt):
-        """Prepare model inputs with comprehensive validation using processor defaults."""
+        """Prepare model inputs with comprehensive validation - COPIED FROM WORKING CODE."""
         try:
             # Let the processor handle everything with its default settings
             inputs = self.processor(
@@ -212,29 +281,84 @@ class MedicalVisionInference:
         except Exception as e:
             self.logger.error(f"Error preparing inputs: {str(e)}")
             raise
-    
 
-    
-    def analyze_medical_image(
+    def generate_structured_report(
         self,
-        image_path: Union[str, Path],
-        prompt: Optional[str] = None,
-        generation_params: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Analyze a medical image and generate detailed findings."""
-        image_path = Path(image_path)
-        if not image_path.exists():
-            raise ValidationError(f"Image not found: {image_path}")
+        model_output: str,
+        image_analysis: Dict,
+        patient_context: Optional[Dict] = None,
+        output_format: str = 'json'
+    ) -> Union[Dict, str]:
+        """Generate a structured medical report."""
+        if not self.report_generator:
+            return {"error": "No report generator available"}
+            
+        self.logger.info("Generating structured medical report...")
         
-        if not hasattr(self.model, 'generate'):
+        try:
+            report = self.report_generator.generate_structured_report(
+                model_output=model_output,
+                image_analysis=image_analysis,
+                patient_context=patient_context
+            )
+            
+            if output_format.lower() == 'json':
+                return self._format_report_as_json(report)
+            elif output_format.lower() == 'text':
+                return self._format_report_as_text(report)
+            else:
+                raise ValueError(f"Unsupported output format: {output_format}")
+                
+        except Exception as e:
+            self.logger.error(f"Error generating structured report: {str(e)}")
+            raise
+
+    def _format_report_as_json(self, report) -> Dict:
+        """Format report as JSON."""
+        return {
+            'clinical_findings': getattr(report, 'clinical_findings', {}),
+            'diagnostic_interpretation': getattr(report, 'diagnostic_interpretation', {}),
+            'technical_details': getattr(report, 'technical_details', {}),
+            'patient_explanation': getattr(report, 'patient_explanation', {}),
+            'additional_notes': getattr(report, 'additional_notes', {}),
+            'metadata': getattr(report, 'metadata', {})
+        }
+        
+    def _format_report_as_text(self, report) -> str:
+        """Format report as text."""
+        sections = []
+        sections.extend([
+            "MEDICAL DIAGNOSTIC REPORT",
+            "=" * 30,
+            f"Report ID: {getattr(report, 'metadata', {}).get('report_id', 'N/A')}",
+            f"Date: {getattr(report, 'metadata', {}).get('timestamp', 'N/A')}\n",
+            "CLINICAL FINDINGS",
+            "-" * 20
+        ])
+        
+        return "\n".join(sections)
+
+    def analyze_image(
+        self,
+        image: Union[str, Path, Image.Image],
+        prompt: Optional[str] = None,
+        generation_params: Optional[Dict] = None
+    ) -> Dict:
+        """Analyze a medical image and generate a report - MAIN ANALYSIS METHOD."""
+        if isinstance(image, (str, Path)):
+            image_path = Path(image)
+            if not image_path.exists():
+                raise ValidationError(f"Image not found: {image_path}")
+            image = Image.open(image_path)
+        
+        if not hasattr(self.model, 'generate') or self.model is None:
             raise ModelLoadError("Model not properly initialized")
 
-        self.logger.info(f"Analyzing medical image: {image_path.name}")
+        self.logger.info(f"Analyzing medical image")
         
         process_start = time.time()
         try:
             # Load and validate image
-            image = Image.open(image_path)
             if image.mode != "RGB":
                 image = image.convert("RGB")
             self.logger.info(f"Image loaded: {image.size} - Mode: {image.mode}")
@@ -251,13 +375,13 @@ class MedicalVisionInference:
                     "Provide a concise, professional medical assessment."
                 )
             
-            # Prepare inputs with validation
+            # Prepare inputs with validation - USING WORKING CODE METHOD
             inputs = self.prepare_inputs_with_validation(image, prompt)
             
             # Use the inputs exactly as the processor created them, with minimal modifications
             generation_inputs = inputs.copy()
             
-            # Create or fix aspect_ratio_ids if needed
+            # Create or fix aspect_ratio_ids if needed - FROM WORKING CODE
             if "aspect_ratio_ids" not in generation_inputs:
                 aspect_ratio = image.size[0] / image.size[1]
                 aspect_ratio_id = 1 if aspect_ratio < 0.75 else 2 if aspect_ratio > 1.33 else 0
@@ -266,7 +390,7 @@ class MedicalVisionInference:
                     dtype=torch.long, device=self.device
                 )
             
-            # Create aspect_ratio_mask if it's missing or None (this is what caused the error)
+            # Create aspect_ratio_mask if it's missing or None - CRITICAL FIX FROM WORKING CODE
             if "aspect_ratio_mask" not in generation_inputs or generation_inputs["aspect_ratio_mask"] is None:
                 # Create a proper aspect_ratio_mask
                 batch_size = inputs["input_ids"].shape[0]
@@ -283,42 +407,28 @@ class MedicalVisionInference:
                 if isinstance(v, torch.Tensor):
                     self.logger.info(f"  {k}: {v.shape}, dtype={v.dtype}, device={v.device}")
             
-            # Generation parameters - optimized to reduce repetition
+            # Generation parameters - FROM WORKING CODE
             gen_params = {
                 "max_new_tokens": 200,
-                "do_sample": True,          # Enable sampling to reduce repetition
-                "temperature": 0.7,         # Moderate randomness
-                "top_p": 0.9,              # Nucleus sampling
-                "repetition_penalty": 1.2,  # Penalize repetition
-                "no_repeat_ngram_size": 3,  # Prevent 3-gram repetition
+                "do_sample": True,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "repetition_penalty": 1.2,
+                "no_repeat_ngram_size": 3,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "eos_token_id": self.tokenizer.eos_token_id
             }
             
-            # Add any custom generation parameters
             if generation_params:
                 gen_params.update(generation_params)
             
-            # Perform generation with detailed error logging
+            # Perform generation - FROM WORKING CODE
             self.logger.info("Starting model inference...")
             gen_start = time.time()
             
             try:
-                # Add detailed debugging before generation
-                self.logger.info("Pre-generation validation:")
-                for k, v in generation_inputs.items():
-                    if v is None:
-                        raise ValueError(f"Input {k} is None before generation")
-                    elif isinstance(v, torch.Tensor):
-                        self.logger.info(f"  {k}: shape={v.shape}, dtype={v.dtype}, device={v.device}, requires_grad={v.requires_grad}")
-                        if torch.isnan(v).any():
-                            raise ValueError(f"Input {k} contains NaN values")
-                        if torch.isinf(v).any():
-                            raise ValueError(f"Input {k} contains infinite values")
-                
                 # Clear any gradients and ensure no grad computation
                 with torch.no_grad():
-                    # Use all inputs including the fixed aspect_ratio_mask
                     self.logger.info("Attempting generation with all required inputs...")
                     outputs = self.model.generate(
                         **generation_inputs,
@@ -328,7 +438,7 @@ class MedicalVisionInference:
                 if outputs is None or len(outputs) == 0:
                     raise RuntimeError("Model generated empty output")
                 
-                # Decode the output
+                # Decode the output - FROM WORKING CODE
                 generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
                 
                 # Remove the prompt from the generated text
@@ -337,7 +447,7 @@ class MedicalVisionInference:
                 else:
                     analysis = generated_text.strip()
                 
-                # Clean up repetitive text (simple approach)
+                # Clean up repetitive text - FROM WORKING CODE
                 sentences = analysis.split('. ')
                 cleaned_sentences = []
                 seen_sentences = set()
@@ -347,7 +457,7 @@ class MedicalVisionInference:
                     if sentence and sentence not in seen_sentences:
                         cleaned_sentences.append(sentence)
                         seen_sentences.add(sentence)
-                    elif len(cleaned_sentences) >= 3:  # Stop after 3 unique sentences if repetition starts
+                    elif len(cleaned_sentences) >= 3:
                         break
                 
                 analysis = '. '.join(cleaned_sentences)
@@ -358,7 +468,35 @@ class MedicalVisionInference:
                 total_time = time.time() - process_start
                 
                 self.logger.info(f"Analysis completed successfully in {gen_time:.2f}s")
-                self.logger.info(f"Generated text length: {len(analysis)} characters")
+                
+                # Try to generate structured report if available
+                try:
+                    if self.report_generator:
+                        image_analysis_data = {
+                            'image_type': 'medical',
+                            'image_quality': {
+                                'dimensions': image.size,
+                                'mode': image.mode,
+                                'aspect_ratio': image.size[0] / image.size[1]
+                            },
+                            'processing_time': gen_time
+                        }
+                        
+                        report = self.generate_structured_report(
+                            model_output=analysis,
+                            image_analysis=image_analysis_data
+                        )
+                        
+                        return {
+                            'analysis': analysis,
+                            'structured_report': report,
+                            'inference_time': gen_time,
+                            'total_time': total_time,
+                            'prompt': prompt,
+                            'success': True
+                        }
+                except Exception as report_error:
+                    self.logger.error(f"Failed to generate structured report: {str(report_error)}")
                 
                 return {
                     'analysis': analysis,
@@ -369,16 +507,10 @@ class MedicalVisionInference:
                 }
                 
             except Exception as e:
-                # Log detailed error information
                 self.logger.error(f"Generation failed with error: {str(e)}")
-                self.logger.error(f"Error type: {type(e).__name__}")
-                
-                # Try to get more specific error info
-                import traceback
                 self.logger.error("Full traceback:")
                 self.logger.error(traceback.format_exc())
-                
-                raise InferenceError(f"Model inference failed: {str(e)}")
+                raise
             
         except Exception as e:
             total_time = time.time() - process_start
@@ -394,24 +526,89 @@ class MedicalVisionInference:
         finally:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-    
-    def get_system_info(self):
+
+    def analyze_medical_image(
+        self,
+        image_path: Union[str, Path],
+        diagnostic_type: str = 'general',
+        custom_prompt: Optional[str] = None
+    ) -> Dict:
+        """Analyze a medical image (compatibility method)."""
+        prompt = custom_prompt
+        if prompt is None:
+            if diagnostic_type == 'general':
+                prompt = (
+                    "Please analyze this medical image. Describe:\n"
+                    "1. Type of imaging and quality\n"
+                    "2. Key anatomical findings\n"
+                    "3. Any abnormalities or pathological features\n"
+                    "4. Possible differential diagnoses\n"
+                    "5. Recommended next steps\n"
+                    "Provide a professional medical assessment."
+                )
+            elif diagnostic_type == 'detailed':
+                prompt = (
+                    "Please provide a detailed analysis of this medical image:\n"
+                    "1. Image type, quality, and positioning\n"
+                    "2. Comprehensive anatomical description\n"
+                    "3. Detailed pathological findings\n"
+                    "4. Measurements and comparisons\n"
+                    "5. Differential diagnoses with likelihood\n"
+                    "6. Recommended follow-up studies\n"
+                    "7. Clinical correlation suggestions"
+                )
+            else:
+                prompt = (
+                    "Analyze this medical image focusing on:\n"
+                    f"- Specific diagnostic type: {diagnostic_type}\n"
+                    "- Key findings and abnormalities\n"
+                    "- Relevant measurements\n"
+                    "- Differential diagnoses\n"
+                    "- Recommendations"
+                )
+        
+        return self.analyze_image(image_path, prompt=prompt)
+
+    def get_system_info(self, detailed: bool = False):
         """Get current system resource usage."""
         info = {
-            'cpu_percent': psutil.cpu_percent(),
-            'ram_usage': psutil.virtual_memory().percent
+            'timestamp': time.time(),
+            'cpu': {
+                'total_percent': psutil.cpu_percent(),
+                'count': psutil.cpu_count()
+            },
+            'memory': {
+                'total': psutil.virtual_memory().total / (1024**3),
+                'available': psutil.virtual_memory().available / (1024**3),
+                'used': psutil.virtual_memory().used / (1024**3),
+                'percent': psutil.virtual_memory().percent
+            }
         }
         
         if torch.cuda.is_available():
-            gpu = GPUtil.getGPUs()[0]
-            info.update({
-                'gpu_name': gpu.name,
-                'gpu_load': gpu.load * 100,
-                'gpu_memory_used': gpu.memoryUsed,
-                'gpu_memory_total': gpu.memoryTotal
-            })
+            try:
+                gpu = GPUtil.getGPUs()[0]
+                gpu_info = {
+                    'name': gpu.name,
+                    'load_percent': gpu.load * 100,
+                    'memory': {
+                        'total': gpu.memoryTotal,
+                        'used': gpu.memoryUsed,
+                        'free': gpu.memoryFree,
+                        'percent': (gpu.memoryUsed / gpu.memoryTotal) * 100
+                    },
+                    'temperature': gpu.temperature,
+                    'uuid': gpu.uuid
+                }
+                
+                info['gpu'] = gpu_info
+                
+            except Exception as e:
+                self.logger.warning(f"Error getting GPU info: {str(e)}")
+                info['gpu'] = {'error': str(e)}
         
         return info
+
 
 def main():
     """Test medical image analysis with the vision model."""
@@ -467,17 +664,27 @@ def main():
             logger.info("-" * 50)
             logger.info(result['analysis'])
             logger.info("-" * 50)
+            
+            # Log performance metrics
+            logger.info(f"Inference time: {result.get('inference_time', 0):.2f} seconds")
+            logger.info(f"Total time: {result.get('total_time', 0):.2f} seconds")
+            
+            # Show structured report if available
+            if 'structured_report' in result:
+                logger.info("Structured report generated successfully")
         else:
             logger.error(f"Analysis failed: {result.get('error', 'Unknown error')}")
         
         # Get system status after analysis
         logger.info("System Status After Analysis:")
-        system_info = inference.get_system_info()
+        system_info = inference.get_system_info(detailed=True)
         for key, value in system_info.items():
             logger.info(f"{key}: {value}")
             
     except Exception as e:
         logger.error(f"Test failed with error: {str(e)}")
+        logger.error(traceback.format_exc())
+
 
 if __name__ == "__main__":
     main()

@@ -6,8 +6,28 @@ import torch
 from PIL import Image
 import numpy as np
 
-def setup_gpu_device() -> Tuple[str, Dict[str, str]]:
+def clear_gpu_memory():
+    """Clear GPU memory and cache."""
+    if torch.cuda.is_available():
+        # Synchronize CUDA
+        torch.cuda.synchronize()
+        
+        # Clear memory multiple times
+        for _ in range(2):
+            torch.cuda.empty_cache()
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        # Reset peak stats
+        torch.cuda.reset_peak_memory_stats()
+
+def setup_gpu_device(target_gpu_usage: float = 7.2) -> Tuple[str, Dict[str, str]]:
     """Configure GPU device and memory settings.
+    
+    Args:
+        target_gpu_usage: Target GPU memory usage in GB (default: 7.2)
     
     Returns:
         Tuple[str, Dict[str, str]]: Device mapping and memory configuration
@@ -15,14 +35,30 @@ def setup_gpu_device() -> Tuple[str, Dict[str, str]]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required for this model")
     
-    gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    free_mem = torch.cuda.memory_allocated(0) / (1024**3)
-    available_mem = gpu_mem - free_mem
-    gpu_limit = min(available_mem * 0.9, 7.5)
+    # Clear any existing memory
+    clear_gpu_memory()
     
-    device_map = "auto"
+    # Set CUDA memory allocation strategy
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+    torch.cuda.set_per_process_memory_fraction(target_gpu_usage / 8.0)  # Assuming 8GB total VRAM
+    
+    # Configure memory mapping
+    device_map = {
+        'model.embed_tokens': 'cuda',
+        'model.layers.0': 'cuda',
+        'model.layers.1': 'cuda',
+        'model.norm': 'cuda',
+        'model.embed_out': 'cuda',
+        'lm_head': 'cuda',
+        'vision_model': 'cuda'
+    }
+    
+    # Map remaining layers to CPU
+    for i in range(2, 32):
+        device_map[f'model.layers.{i}'] = 'cpu'
+    
     max_memory = {
-        0: f"{gpu_limit:.1f}GB",
+        0: f"{target_gpu_usage:.1f}GB",
         "cpu": "16GB"
     }
     
